@@ -1,0 +1,24 @@
+# Ambientes Virtuais (VENV)
+venv/
+.venv/
+env/
+bin/
+include/
+lib/
+share/
+pyvenv.cfg
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Arquivos do Sistema Operacional
+.DS_Store
+Thumbs.db
+
+# Arquivos de Dados Temporários (Opcional)
+*.csv
+*.xlsx
+*.pdf
+!modules/  # Garante que a pasta modules nunca seja ignorada
