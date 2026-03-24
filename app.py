@@ -10,12 +10,10 @@ st.set_page_config(page_title="NandoTools - Multi-Ferramentas", layout="wide", p
 
 # --- 2. FUNÇÕES DE SUPORTE (Lógica isolada para evitar erros de indentação) ---
 def limpar_caracteres_ilegais(df):
-    return df.applymap(
-        lambda x: re.sub(r'[\x00-\x1F\x7F]', '', x) if isinstance(x, str) else x
-    )
-    
-    # Aplicamos a remoção em todas as colunas de texto (object)
-    return df.applymap(lambda x: illegal_char_re.sub("", x) if isinstance(x, str) else x)
+    for col in df.select_dtypes(include=['object']):
+        df[col] = df[col].str.replace(r'[\x00-\x1F\x7F]', '', regex=True)
+    return df
+
 def corrigir_estrutura_csv(file_buffer, separador, total_colunas_esperado):
     output = []
     file_buffer.seek(0)
@@ -352,9 +350,6 @@ elif opcao == "PROCV Dinâmico":
                 # 🔥 APLICAÇÃO NAS CHAVES
                 df_main[key_main] = normalizar_chave(df_main[key_main])
                 df_ref[key_ref] = normalizar_chave(df_ref[key_ref])
-                
-                st.write("Preview chave main:", df_main[key_main].head())
-                st.write("Preview chave ref:", df_ref[key_ref].head())
                 
                 # 2. Cruzamento
                 df_ref_filtered = df_ref[[key_ref] + cols_to_bring]
