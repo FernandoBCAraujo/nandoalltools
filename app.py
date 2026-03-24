@@ -2,18 +2,30 @@ import streamlit as st
 import unicodedata
 import pandas as pd
 import io
+import re
 from pypdf import PdfWriter, PdfReader
 
 # 1. CONFIGURAÇÃO DA PÁGINA (Deve ser o primeiro comando)
 st.set_page_config(page_title="NandoTools - Multi-Ferramentas", layout="wide", page_icon="🛠️")
 
 # --- 2. FUNÇÕES DE SUPORTE (Lógica isolada para evitar erros de indentação) ---
-
+def limpar_caracteres_ilegais(df):
+    return df.applymap(
+        lambda x: re.sub(r'[\x00-\x1F\x7F]', '', x) if isinstance(x, str) else x
+    )
+    
+    # Aplicamos a remoção em todas as colunas de texto (object)
+    return df.applymap(lambda x: illegal_char_re.sub("", x) if isinstance(x, str) else x)
 def corrigir_estrutura_csv(file_buffer, separador, total_colunas_esperado):
     output = []
     file_buffer.seek(0)
     for linha_binaria in file_buffer:
-        linha_texto = linha_binaria.decode("utf-8").strip()
+        # Tenta decodificar de forma segura
+        try:
+            linha_texto = linha_binaria.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            linha_texto = linha_binaria.decode("iso-8859-1").strip()
+            
         if not linha_texto:
             continue
         
@@ -60,11 +72,19 @@ elif opcao == "Validar/Corrigir CSV":
         uploaded_file = st.file_uploader("Suba seu arquivo CSV para análise", type="csv", key="validador")
 
         if uploaded_file:
-            # Identificação de padrão
-            primeira_linha = uploaded_file.readline().decode("utf-8").strip()
+            # --- LEITURA RESILIENTE DA PRIMEIRA LINHA ---
+            conteudo_bruto = uploaded_file.readline()
+            try:
+                # Tenta UTF-8 (Padrão moderno)
+                primeira_linha = conteudo_bruto.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                # Se falhar, usa ISO-8859-1 (Padrão Excel/Windows Brasil)
+                primeira_linha = conteudo_bruto.decode("iso-8859-1").strip()
+            
+            # Identificação do separador e colunas
             sep = ";" if primeira_linha.count(";") > primeira_linha.count(",") else ","
             qtd_esperada = len(primeira_linha.split(sep))
-            uploaded_file.seek(0)
+            uploaded_file.seek(0) # Volta para o início para o validador/corretor poder ler tudo
 
             st.info(f"Separador: `{sep}` | Colunas esperadas: **{qtd_esperada}**")
 
@@ -73,8 +93,20 @@ elif opcao == "Validar/Corrigir CSV":
                 total = 0
                 for idx, linha in enumerate(uploaded_file):
                     total += 1
-                    txt = linha.decode("utf-8").strip()
+                    # --- DECODIFICAÇÃO SEGURA POR LINHA ---
+                    try:
+                        txt = linha.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        try:
+                            # Tenta o padrão Windows/Brasil
+                            txt = linha.decode("iso-8859-1").strip()
+                        except UnicodeDecodeError:
+                            # Tenta UTF-16 (comum para o erro 0xff)
+                            txt = linha.decode("utf-16").strip()
+                    
                     if not txt: continue
+                    
+                    # Validação da quantidade de colunas
                     if len(txt.split(sep)) != qtd_esperada:
                         erros.append(f"Linha {idx+1}: {txt[:50]}...")
                 
@@ -261,7 +293,23 @@ elif opcao == "PROCV Dinâmico":
 
     def load_data(file):
         if file.name.endswith('.csv'):
-            return pd.read_csv(file)
+            encodings = ['utf-8', 'utf-16', 'iso-8859-1', 'cp1252']
+            
+            for encoding in encodings:
+                try:
+                    file.seek(0)
+                    df = pd.read_csv(file, sep=None, encoding=encoding, engine='python')
+                    
+                    # 🔥 valida se veio "quebrado" (com muitos \x00)
+                    if df.astype(str).apply(lambda col: col.str.contains('\x00')).any().any():
+                        continue
+                    
+                    return df
+                except (UnicodeDecodeError, pd.errors.ParserError):
+                    continue
+
+            st.error(f"Não foi possível ler o arquivo {file.name}. Verifique a codificação.")
+            return None
         else:
             return pd.read_excel(file)
 
@@ -287,67 +335,65 @@ elif opcao == "PROCV Dinâmico":
             [c for c in df_ref.columns if c != key_ref]
     )
 
-    if st.button("Executar Cruzamento de dados"):
-        if not cols_to_bring:
-            st.warning("Selecione pelo menos uma coluna para trazer da tabela de referência.")
-        else:
-            # Selecionamos apenas a chave e as colunas desejadas da tabela de referência
-            df_ref_filtered = df_ref[[key_ref] + cols_to_bring]
-            
-            # O 'left join' preserva tudo da principal e traz o que encontrar na referência
-            resultado = pd.merge(
-                df_main, 
-                df_ref_filtered, 
-                left_on=key_main, 
-                right_on=key_ref, 
-                how='left'
-            )
+        if st.button("Executar Cruzamento de dados"):
+            if not cols_to_bring:
+                st.warning("Selecione as colunas para trazer.")
+            else:
+                def normalizar_chave(col):
+                    return (
+                        col.fillna('')  # 🔥 remove NaN
+                        .astype(str)
+                        .str.replace(r'\.0$', '', regex=True)
+                        .str.replace(r'[\x00-\x1F\x7F]', '', regex=True)
+                        .str.strip()
+                        .str.lower()
+                    )
 
-            # Se as chaves tiverem nomes diferentes, o pandas mantém ambas. 
-            # Podemos remover a chave duplicada da referência para limpar o df.
-            if key_main != key_ref:
+                # 🔥 APLICAÇÃO NAS CHAVES
+                df_main[key_main] = normalizar_chave(df_main[key_main])
+                df_ref[key_ref] = normalizar_chave(df_ref[key_ref])
+                
+                st.write("Preview chave main:", df_main[key_main].head())
+                st.write("Preview chave ref:", df_ref[key_ref].head())
+                
+                # 2. Cruzamento
+                df_ref_filtered = df_ref[[key_ref] + cols_to_bring]
+                resultado = pd.merge(df_main, df_ref_filtered, left_on=key_main, right_on=key_ref, how='left')
                 resultado = resultado.drop(columns=[key_ref])
+                resultado = limpar_caracteres_ilegais(resultado)
+                st.success("Cruzamento concluído!")
+                st.dataframe(resultado.head(10))
 
-            st.success("Cruzamento concluído com sucesso!")
-            # Criamos uma cópia para exibição com o índice ajustado
-            df_exibicao = resultado.head(10).copy()
-            df_exibicao.index = df_exibicao.index + 1
-
-            st.dataframe(df_exibicao)
-
-            st.divider()
-            st.subheader("📥 Baixar Resultado")
-            
-            # Criamos duas colunas para os botões de download
-            btn_col1, btn_col2 = st.columns(2)
-
-            with btn_col1:
-                # Preparação para Excel
-                output_excel = io.BytesIO()
-                with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                    resultado.to_excel(writer, index=False)
+                # --- TUDO ABAIXO DEVE ESTAR IDENTADO DENTRO DO IF ---
+                st.divider()
+                st.subheader("📥 Baixar Resultado")
                 
-                st.download_button(
-                    label="Baixar em Excel (.xlsx)",
-                    data=output_excel.getvalue(),
-                    file_name="resultado_procv.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                btn_col1, btn_col2 = st.columns(2)
 
-            with btn_col2:
-                # Preparação para CSV
-                # O parâmetro index=False evita que o pandas crie uma coluna extra com os números das linhas
-                output_csv = resultado.to_csv(index=False).encode('utf-8-sig') # utf-8-sig garante compatibilidade com Excel
-                
-                st.download_button(
-                    label="Baixar em CSV (.csv)",
-                    data=output_csv,
-                    file_name="resultado_procv.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                
-                )
+                with btn_col1:
+                    output_excel = io.BytesIO()
+                    # engine='openpyxl' é essencial para .xlsx
+                    with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                        resultado.to_excel(writer, index=False)
+                    
+                    st.download_button(
+                        label="Baixar em Excel (.xlsx)",
+                        data=output_excel.getvalue(),
+                        file_name="resultado_procv.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+
+                with btn_col2:
+                    output_csv = resultado.to_csv(index=False).encode('utf-8-sig')
+                    
+                    st.download_button(
+                        label="Baixar em CSV (.csv)",
+                        data=output_csv,
+                        file_name="resultado_procv.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
                 
                     
                 
